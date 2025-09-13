@@ -1,16 +1,14 @@
 import os
-import io
 import re
-import json
+import io
 import urllib.parse
 import asyncio
 import aiohttp
 import pandas as pd
 import streamlit as st
 from datetime import datetime
-from typing import List, Dict, Callable
 
-st.set_page_config(page_title="ASIN → Product Exporter", page_icon="🛒", layout="wide")
+st.set_page_config(page_title="SKU → ASIN Exporter (J17 only)", page_icon="📦", layout="wide")
 
 # =========================
 # Secrets
@@ -41,7 +39,7 @@ def do_logout():
     st.session_state.auth_ok = False
 
 if not st.session_state.auth_ok:
-    st.title("🔒 ASIN → Product Exporter")
+    st.title("🔒 SKU → ASIN Exporter (J17 only)")
     st.caption("Enter password to continue.")
     pw = st.text_input("Password", type="password")
     if st.button("Login"):
@@ -49,197 +47,78 @@ if not st.session_state.auth_ok:
     st.stop()
 
 # =========================
-# History storage (ephemeral)
+# UI
 # =========================
-HISTORY_DIR = "history"
-INDEX_PATH = os.path.join(HISTORY_DIR, "index.json")
+st.title("SKU → ASIN Exporter (J17 only)")
+st.caption(
+    "Processes only rows where **Custom label (SKU)** starts with `J17`. "
+    "For those, removes the first 3 characters to form an ASIN and fetches data only if it matches the Amazon ASIN pattern (10 alphanumeric). "
+    "All other rows are kept with Amazon fields marked as **not found**."
+)
+st.button("Logout", on_click=do_logout)
 
-os.makedirs(HISTORY_DIR, exist_ok=True)
-if not os.path.exists(INDEX_PATH):
-    with open(INDEX_PATH, "w") as f:
-        json.dump([], f)
-
-def load_history() -> List[Dict]:
-    try:
-        with open(INDEX_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def save_history_entry(entry: Dict):
-    entries = load_history()
-    entries.insert(0, entry)  # newest first
-    with open(INDEX_PATH, "w") as f:
-        json.dump(entries, f, indent=2)
-
-def ts() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def save_uploaded_copy(uploaded_file) -> str:
-    stamp = ts()
-    base = os.path.splitext(uploaded_file.name)[0]
-    dest = os.path.join(HISTORY_DIR, f"{base}_INPUT_{stamp}.xlsx")
-    with open(dest, "wb") as out:
-        out.write(uploaded_file.getvalue())
-    return dest
-
-def save_output_excel(df: pd.DataFrame, base_name: str) -> str:
-    out_name = os.path.join(HISTORY_DIR, f"{base_name}_RESULTS_{ts()}.xlsx")
-    df.to_excel(out_name, index=False)
-    return out_name
-
-# =========================
-# Layout
-# =========================
-st.title("ASIN → Product Exporter")
-st.caption("Upload an Excel with an **ASIN** column. Get back an Excel with product details.")
-top_bar = st.container()
-col_left, col_right = st.columns([3, 2])
-
-with top_bar:
-    st.button("Logout", on_click=do_logout)
-
-# Sidebar: History viewer
-with st.sidebar:
-    st.header("🗂️ History")
-    hist = load_history()
-    if not hist:
-        st.caption("No runs yet.")
-    else:
-        for i, item in enumerate(hist[:20]):  # show last 20
-            with st.expander(f"Run {item.get('timestamp')} • {item.get('count',0)} ASINs"):
-                st.caption(f"Domain: {item.get('domain')}")
-                in_path = item.get("input_path")
-                out_path = item.get("output_path")
-                if in_path and os.path.exists(in_path):
-                    with open(in_path, "rb") as f:
-                        st.download_button("⬇️ Download input", f.read(),
-                                           file_name=os.path.basename(in_path),
-                                           key=f"in_{i}")
-                if out_path and os.path.exists(out_path):
-                    with open(out_path, "rb") as f:
-                        st.download_button("⬇️ Download output", f.read(),
-                                           file_name=os.path.basename(out_path),
-                                           key=f"out_{i}")
-
-# =========================
-# Controls + File upload
-# =========================
-with col_left:
+left, right = st.columns([3, 2])
+with left:
     c1, c2 = st.columns(2)
     with c1:
-        domain = st.text_input("Domain", value="www.amazon.com.au")
+        domain = st.text_input("Amazon domain", value="www.amazon.com.au")
     with c2:
         max_concurrency = st.slider("Max concurrent requests", 1, 20, 20)
 
-    uploaded = st.file_uploader("Upload Excel (.xlsx) with an 'ASIN' column", type=["xlsx"])
+    upl = st.file_uploader(
+        "Upload file (.csv or .xlsx) with a **Custom label (SKU)** column",
+        type=["csv", "xlsx"]
+    )
 
-# Right column: live log & progress
-with col_right:
+with right:
     st.subheader("Live log")
     log_box = st.container()
     progress_bar = st.progress(0, text="Idle")
     counter_txt = st.empty()
 
 # =========================
-# Helpers / Scraper
+# Helpers
 # =========================
+ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
+
 def sanitize_text(s: str) -> str:
     """Replace the standalone word 'amazon' (any case) with 'ams'."""
     if not isinstance(s, str):
         return s
     return re.sub(r'\bamazon\b', 'ams', s, flags=re.IGNORECASE)
 
-async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, asin: str, sem: asyncio.Semaphore):
-    amazon_url = f"https://{domain}/dp/{asin}"
-    encoded_url = urllib.parse.quote(amazon_url, safe="")
-    api_url = f"https://api.crawlbase.com/?token={token}&url={encoded_url}&scraper=amazon-product-details"
-    async with sem:
-        try:
-            async with session.get(api_url, timeout=60) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception as e:
-                    text = await resp.text()
-                    return {
-                        'ASIN': asin, 'TITLE': None,
-                        'body_html': f"Error parsing response: {e}\n{text[:300]}",
-                        'price': None, 'highResolutionImages': None, 'Brand': None,
-                        'isPrime': None, 'inStock': None, 'stockDetail': None,
-                        '_ok': False, '_msg': f"Parse error: {e}"
-                    }
-                if isinstance(data, dict) and 'error' in data:
-                    return {
-                        'ASIN': asin, 'TITLE': None,
-                        'body_html': f"Error: {data.get('error')}",
-                        'price': None, 'highResolutionImages': None, 'Brand': None,
-                        'isPrime': None, 'inStock': None, 'stockDetail': None,
-                        '_ok': False, '_msg': f"API error: {data.get('error')}"
-                    }
-                body = (data or {}).get('body', {}) if isinstance(data, dict) else {}
-                features = body.get('features', []) or []
-                description = body.get('description', '') or ''
-                images = body.get('highResolutionImages', []) or []
-                html_features = '<br>'.join(features) if features else ''
-                html_combined = f"{html_features}<br><br>{description}" if html_features else description
-                images_cleaned = ', '.join(images) if isinstance(images, list) else ''
-                result = {
-                    'ASIN': asin,
-                    'TITLE': sanitize_text(body.get('name')),
-                    'body_html': sanitize_text(html_combined),
-                    'price': body.get('rawPrice'),
-                    'highResolutionImages': images_cleaned,
-                    'Brand': sanitize_text(body.get('brand')),
-                    'isPrime': body.get('isPrime'),
-                    'inStock': body.get('inStock'),
-                    'stockDetail': body.get('stockDetail')
-                }
-                result['_ok'] = True
-                result['_msg'] = "OK"
-                return result
-        except Exception as e:
-            return {
-                'ASIN': asin, 'TITLE': None,
-                'body_html': f"Exception: {e}",
-                'price': None, 'highResolutionImages': None, 'Brand': None,
-                'isPrime': None, 'inStock': None, 'stockDetail': None,
-                '_ok': False, '_msg': f"Exception: {e}"
-            }
+def asin_from_sku_j17(sku: str) -> str | None:
+    """
+    If SKU starts with 'J17', return the next 10 alphanumeric chars (exactly),
+    otherwise None. Only accept if it matches ASIN pattern exactly.
+    """
+    if not isinstance(sku, str):
+        return None
+    sku = sku.strip()
+    if not sku.startswith("J17"):
+        return None
+    candidate = sku[3:].strip().upper()
+    if ASIN_RE.fullmatch(candidate):
+        return candidate
+    return None
 
-async def process_asins(
-    token: str,
-    domain: str,
-    asins: List[str],
-    max_concurrency: int,
-    progress_cb: Callable[[int, int], None],
-    log_cb: Callable[[Dict], None]
-):
-    sem = asyncio.Semaphore(max_concurrency)
-    results, total, done = [], len(asins), 0
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_asin(session, token, domain, a, sem) for a in asins]
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            results.append(res)
-            done += 1
-            if log_cb:
-                log_cb(res)
-            if progress_cb:
-                progress_cb(done, total)
-    return results
+def unique_preserve_order(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x is None:
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-def render_log_line(entry: Dict):
-    ok = entry.get("_ok", False)
-    asin = entry.get("ASIN", "")
-    title = entry.get("TITLE") or ""
-    msg = entry.get("_msg", "")
-    stock = entry.get("inStock")
-    prime = entry.get("isPrime")
-    emoji = "✅" if ok else "❌"
-    title_snip = title[:60] + ("…" if title and len(title) > 60 else "")
-    stock_txt = "inStock" if stock else "outOfStock" if stock is not None else "stock?"
-    prime_txt = "Prime" if prime else "NoPrime" if prime is not None else "prime?"
-    return f"{emoji} {asin} • {title_snip} • {stock_txt} • {prime_txt} • {msg}"
+def render_log_line(asin: str | None, status: str, title: str | None = None):
+    if asin is None:
+        return f"❌ (skipped) • not J17 or invalid"
+    title_snip = (title or "")[:60]
+    emoji = "✅" if status == "OK" else "❌"
+    return f"{emoji} {asin} • {title_snip} • {status}"
 
 def update_progress(done: int, total: int):
     pct = int((done / total) * 100) if total else 0
@@ -247,74 +126,162 @@ def update_progress(done: int, total: int):
     counter_txt.write(f"Processed {done} of {total}")
 
 # =========================
-# Main action
+# Crawlbase fetch
 # =========================
-if uploaded is not None:
+async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, asin: str, sem: asyncio.Semaphore):
+    """Fetch single ASIN from Crawlbase (amazon-product-details)."""
+    amazon_url = f"https://{domain}/dp/{asin}"
+    encoded_url = urllib.parse.quote(amazon_url, safe="")
+    api_url = f"https://api.crawlbase.com/?token={token}&url={encoded_url}&scraper=amazon-product-details"
+
+    async with sem:
+        try:
+            async with session.get(api_url, timeout=60) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception as e:
+                    return {
+                        "ASIN": asin, "TITLE": None, "body_html": f"Parse error: {e}",
+                        "price": None, "highResolutionImages": None, "Brand": None,
+                        "isPrime": None, "inStock": None, "stockDetail": None,
+                        "_ok": False, "_msg": f"Parse error: {e}"
+                    }
+
+                if isinstance(data, dict) and data.get("error"):
+                    return {
+                        "ASIN": asin, "TITLE": None, "body_html": f"API error: {data.get('error')}",
+                        "price": None, "highResolutionImages": None, "Brand": None,
+                        "isPrime": None, "inStock": None, "stockDetail": None,
+                        "_ok": False, "_msg": f"API error: {data.get('error')}"
+                    }
+
+                body = (data or {}).get("body", {}) if isinstance(data, dict) else {}
+                features = body.get("features", []) or []
+                description = body.get("description", "") or ""
+                images = body.get("highResolutionImages", []) or []
+
+                html_features = "<br>".join(features) if features else ""
+                html_combined = f"{html_features}<br><br>{description}" if html_features else description
+                images_cleaned = ", ".join(images) if isinstance(images, list) else ""
+
+                return {
+                    "ASIN": asin,
+                    "TITLE": sanitize_text(body.get("name")),
+                    "body_html": sanitize_text(html_combined),
+                    "price": body.get("rawPrice"),
+                    "highResolutionImages": images_cleaned,
+                    "Brand": sanitize_text(body.get("brand")),
+                    "isPrime": body.get("isPrime"),
+                    "inStock": body.get("inStock"),
+                    "stockDetail": body.get("stockDetail"),
+                    "_ok": True, "_msg": "OK"
+                }
+        except Exception as e:
+            return {
+                "ASIN": asin, "TITLE": None, "body_html": f"Exception: {e}",
+                "price": None, "highResolutionImages": None, "Brand": None,
+                "isPrime": None, "inStock": None, "stockDetail": None,
+                "_ok": False, "_msg": f"Exception: {e}"
+            }
+
+async def fetch_all(asins: list[str], token: str, domain: str, max_conc: int, log_cb=None, prog_cb=None):
+    sem = asyncio.Semaphore(max_conc)
+    out, total, done = [], len(asins), 0
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_asin(session, token, domain, a, sem) for a in asins]
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            out.append(res)
+            done += 1
+            if log_cb:
+                log_cb(render_log_line(res.get("ASIN"), res.get("_msg", ""), res.get("TITLE")))
+            if prog_cb:
+                prog_cb(done, total)
+    return out
+
+# =========================
+# Main
+# =========================
+AMZ_COLS = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
+
+if upl is not None:
+    # Read CSV/XLSX
     try:
-        df_in = pd.read_excel(uploaded)
+        if upl.name.lower().endswith(".csv"):
+            df_in = pd.read_csv(upl)
+        else:
+            df_in = pd.read_excel(upl)
     except Exception as e:
-        st.error(f"Could not read Excel: {e}")
+        st.error(f"Could not read file: {e}")
         st.stop()
 
-    if 'ASIN' not in df_in.columns:
-        st.error("Input file must contain 'ASIN' column.")
+    if "Custom label (SKU)" not in df_in.columns:
+        st.error("Input must contain a column named 'Custom label (SKU)'.")
         st.stop()
 
-    asins = df_in['ASIN'].dropna().astype(str).tolist()
-    st.success(f"Loaded {len(asins)} ASINs.")
+    # Derive ASIN only for SKUs starting with J17 and exactly 10 alnum after removing 3 chars.
+    df_in = df_in.copy()
+    df_in["ASIN"] = df_in["Custom label (SKU)"].apply(asin_from_sku_j17)
+
+    # Build fetch list (valid, unique ASINs)
+    valid_asins = [a for a in df_in["ASIN"].tolist() if a is not None]
+    valid_asins = unique_preserve_order(valid_asins)
+
+    st.success(
+        f"Rows: {len(df_in)} | J17 ASIN candidates: {len(df_in['ASIN'].notna().nonzero()[0])} | "
+        f"Unique valid ASINs to fetch: {len(valid_asins)}"
+    )
 
     if st.button("Run"):
-        # Save a copy of the uploaded file to history
-        input_copy_path = save_uploaded_copy(uploaded)
-
-        # Prepare live log UI
+        # Live log
         log_holder = log_box.empty()
-        log_lines: List[str] = []
-        def log_cb(res: Dict):
-            line = render_log_line(res)
+        log_lines: list[str] = []
+
+        def add_log(line: str):
             log_lines.append(line)
-            # show last 200 lines
             log_holder.write("\n".join(log_lines[-200:]))
 
-        with st.spinner("Fetching product details…"):
+        # Log skipped rows (non-J17 or invalid after trimming)
+        skipped = df_in[df_in["ASIN"].isna()]
+        for _ in range(min(len(skipped), 200)):  # avoid spamming too much
+            add_log(render_log_line(None, "skipped (not J17 or invalid)"))
+
+        # Fetch only valid ASINs
+        with st.spinner("Fetching Amazon details…"):
             results = asyncio.run(
-                process_asins(
-                    CRAWLBASE_TOKEN,
-                    domain,
-                    asins,
-                    max_concurrency,
-                    progress_cb=update_progress,
-                    log_cb=log_cb
-                )
+                fetch_all(valid_asins, CRAWLBASE_TOKEN, domain, max_concurrency, log_cb=add_log, prog_cb=update_progress)
             )
 
-        desired = ['ASIN','TITLE','body_html','price','highResolutionImages','Brand','isPrime','inStock','stockDetail']
-        df_out = pd.DataFrame(results)
-        for c in desired:
-            if c not in df_out.columns:
-                df_out[c] = None
-        df_out = df_out[desired]
+        # Results to DF keyed by ASIN
+        df_amz = pd.DataFrame(results) if results else pd.DataFrame(columns=["ASIN"] + AMZ_COLS + ["_ok","_msg"])
+        for c in AMZ_COLS:
+            if c not in df_amz.columns:
+                df_amz[c] = None
+
+        # Merge onto original rows; rows with ASIN=None will have NaNs → fill "not found"
+        df_merge = df_in.merge(
+            df_amz[["ASIN"] + AMZ_COLS],
+            how="left",
+            on="ASIN"
+        )
+
+        # Fill missing Amazon fields with "not found"
+        for c in AMZ_COLS:
+            df_merge[c] = df_merge[c].where(df_merge[c].notna(), "not found")
 
         st.success("Done! Preview:")
-        st.dataframe(df_out.head(20), use_container_width=True)
+        preview_cols = ["Custom label (SKU)", "ASIN"] + AMZ_COLS
+        existing = [c for c in preview_cols if c in df_merge.columns]
+        st.dataframe(df_merge[existing].head(20), use_container_width=True)
 
-        # Save output + add to history
-        base = os.path.splitext(uploaded.name)[0]
-        output_path = save_output_excel(df_out, base)
-        save_history_entry({
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "domain": domain,
-            "count": len(asins),
-            "input_path": input_copy_path,
-            "output_path": output_path
-        })
-
-        # Download button for this run
-        with open(output_path, "rb") as f:
-            st.download_button(
-                "⬇️ Download results (.xlsx)",
-                data=f.read(),
-                file_name=os.path.basename(output_path),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+        # Download enriched CSV (all columns)
+        ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"{os.path.splitext(upl.name)[0]}_ENRICHED_{ts_now}.csv"
+        csv_bytes = df_merge.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download enriched CSV",
+            data=csv_bytes,
+            file_name=out_name,
+            mime="text/csv",
+            use_container_width=True
+        )
