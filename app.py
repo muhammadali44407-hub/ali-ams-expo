@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import urllib.parse
 import asyncio
 import aiohttp
@@ -80,6 +79,8 @@ with right:
 # Helpers
 # =========================
 ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
+AMZ_COLS = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
+SKU_COL = "Custom label (SKU)"   # back to original
 
 def sanitize_text(s: str) -> str:
     """Replace the standalone word 'amazon' (any case) with 'ams'."""
@@ -88,10 +89,6 @@ def sanitize_text(s: str) -> str:
     return re.sub(r'\bamazon\b', 'ams', s, flags=re.IGNORECASE)
 
 def asin_from_sku_j17(sku: str) -> str | None:
-    """
-    If SKU starts with 'J17', return the next 10 alphanumeric chars (exactly),
-    otherwise None. Only accept if it matches ASIN pattern exactly.
-    """
     if not isinstance(sku, str):
         return None
     sku = sku.strip()
@@ -129,7 +126,6 @@ def update_progress(done: int, total: int):
 # Crawlbase fetch
 # =========================
 async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, asin: str, sem: asyncio.Semaphore):
-    """Fetch single ASIN from Crawlbase (amazon-product-details)."""
     amazon_url = f"https://{domain}/dp/{asin}"
     encoded_url = urllib.parse.quote(amazon_url, safe="")
     api_url = f"https://api.crawlbase.com/?token={token}&url={encoded_url}&scraper=amazon-product-details"
@@ -137,33 +133,16 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
     async with sem:
         try:
             async with session.get(api_url, timeout=60) as resp:
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception as e:
-                    return {
-                        "ASIN": asin, "TITLE": None, "body_html": f"Parse error: {e}",
-                        "price": None, "highResolutionImages": None, "Brand": None,
-                        "isPrime": None, "inStock": None, "stockDetail": None,
-                        "_ok": False, "_msg": f"Parse error: {e}"
-                    }
-
+                data = await resp.json(content_type=None)
                 if isinstance(data, dict) and data.get("error"):
-                    return {
-                        "ASIN": asin, "TITLE": None, "body_html": f"API error: {data.get('error')}",
-                        "price": None, "highResolutionImages": None, "Brand": None,
-                        "isPrime": None, "inStock": None, "stockDetail": None,
-                        "_ok": False, "_msg": f"API error: {data.get('error')}"
-                    }
-
+                    return {"ASIN": asin, "_ok": False, "_msg": f"API error: {data.get('error')}"}
                 body = (data or {}).get("body", {}) if isinstance(data, dict) else {}
                 features = body.get("features", []) or []
                 description = body.get("description", "") or ""
                 images = body.get("highResolutionImages", []) or []
-
                 html_features = "<br>".join(features) if features else ""
                 html_combined = f"{html_features}<br><br>{description}" if html_features else description
                 images_cleaned = ", ".join(images) if isinstance(images, list) else ""
-
                 return {
                     "ASIN": asin,
                     "TITLE": sanitize_text(body.get("name")),
@@ -177,14 +156,9 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
                     "_ok": True, "_msg": "OK"
                 }
         except Exception as e:
-            return {
-                "ASIN": asin, "TITLE": None, "body_html": f"Exception: {e}",
-                "price": None, "highResolutionImages": None, "Brand": None,
-                "isPrime": None, "inStock": None, "stockDetail": None,
-                "_ok": False, "_msg": f"Exception: {e}"
-            }
+            return {"ASIN": asin, "_ok": False, "_msg": f"Exception: {e}"}
 
-async def fetch_all(asins: list[str], token: str, domain: str, max_conc: int, log_cb=None, prog_cb=None):
+async def fetch_all(asins, token, domain, max_conc, log_cb=None, prog_cb=None):
     sem = asyncio.Semaphore(max_conc)
     out, total, done = [], len(asins), 0
     async with aiohttp.ClientSession() as session:
@@ -202,10 +176,7 @@ async def fetch_all(asins: list[str], token: str, domain: str, max_conc: int, lo
 # =========================
 # Main
 # =========================
-AMZ_COLS = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
-
 if upl is not None:
-    # Read CSV/XLSX
     try:
         if upl.name.lower().endswith(".csv"):
             df_in = pd.read_csv(upl)
@@ -215,73 +186,52 @@ if upl is not None:
         st.error(f"Could not read file: {e}")
         st.stop()
 
-    if "Custom label (SKU)" not in df_in.columns:
-        st.error("Input must contain a column named 'Custom label (SKU)'.")
+    if SKU_COL not in df_in.columns:
+        st.error(f"Input must contain a column named '{SKU_COL}'.")
         st.stop()
 
-    # Derive ASIN only for SKUs starting with J17 and exactly 10 alnum after removing 3 chars.
     df_in = df_in.copy()
-    df_in["ASIN"] = df_in["Custom label (SKU)"].apply(asin_from_sku_j17)
+    df_in["ASIN"] = df_in[SKU_COL].apply(asin_from_sku_j17)
 
-    # Build fetch list (valid, unique ASINs)
-    valid_asins = [a for a in df_in["ASIN"].tolist() if a is not None]
-    valid_asins = unique_preserve_order(valid_asins)
+    valid_asins = unique_preserve_order([a for a in df_in["ASIN"].tolist() if a is not None])
 
     st.success(
-        f"Rows: {len(df_in)} | J17 ASIN candidates: {len(df_in['ASIN'].notna().nonzero()[0])} | "
+        f"Rows: {len(df_in)} | J17 ASIN candidates: {df_in['ASIN'].notna().sum()} | "
         f"Unique valid ASINs to fetch: {len(valid_asins)}"
     )
 
     if st.button("Run"):
-        # Live log
         log_holder = log_box.empty()
-        log_lines: list[str] = []
+        log_lines = []
 
         def add_log(line: str):
             log_lines.append(line)
             log_holder.write("\n".join(log_lines[-200:]))
 
-        # Log skipped rows (non-J17 or invalid after trimming)
         skipped = df_in[df_in["ASIN"].isna()]
-        for _ in range(min(len(skipped), 200)):  # avoid spamming too much
+        for _ in range(min(len(skipped), 200)):
             add_log(render_log_line(None, "skipped (not J17 or invalid)"))
 
-        # Fetch only valid ASINs
         with st.spinner("Fetching Amazon details…"):
             results = asyncio.run(
                 fetch_all(valid_asins, CRAWLBASE_TOKEN, domain, max_concurrency, log_cb=add_log, prog_cb=update_progress)
             )
 
-        # Results to DF keyed by ASIN
-        df_amz = pd.DataFrame(results) if results else pd.DataFrame(columns=["ASIN"] + AMZ_COLS + ["_ok","_msg"])
-        for c in AMZ_COLS:
-            if c not in df_amz.columns:
-                df_amz[c] = None
+        df_amz = pd.DataFrame(results) if results else pd.DataFrame(columns=["ASIN"]+AMZ_COLS+["_ok","_msg"])
+        # deduplicate: keep best per ASIN
+        df_amz = df_amz.sort_values(by=["_ok","price","TITLE"], ascending=[False, False, False])
+        df_amz = df_amz.drop_duplicates(subset="ASIN", keep="first")
 
-        # Merge onto original rows; rows with ASIN=None will have NaNs → fill "not found"
-        df_merge = df_in.merge(
-            df_amz[["ASIN"] + AMZ_COLS],
-            how="left",
-            on="ASIN"
-        )
+        df_merge = df_in.merge(df_amz[["ASIN"]+AMZ_COLS], how="left", on="ASIN")
 
-        # Fill missing Amazon fields with "not found"
         for c in AMZ_COLS:
             df_merge[c] = df_merge[c].where(df_merge[c].notna(), "not found")
 
         st.success("Done! Preview:")
-        preview_cols = ["Custom label (SKU)", "ASIN"] + AMZ_COLS
-        existing = [c for c in preview_cols if c in df_merge.columns]
-        st.dataframe(df_merge[existing].head(20), use_container_width=True)
+        preview_cols = [SKU_COL, "ASIN"] + AMZ_COLS
+        st.dataframe(df_merge[preview_cols].head(20), use_container_width=True)
 
-        # Download enriched CSV (all columns)
         ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_name = f"{os.path.splitext(upl.name)[0]}_ENRICHED_{ts_now}.csv"
         csv_bytes = df_merge.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download enriched CSV",
-            data=csv_bytes,
-            file_name=out_name,
-            mime="text/csv",
-            use_container_width=True
-        )
+        st.download_button("⬇️ Download enriched CSV", data=csv_bytes, file_name=out_name, mime="text/csv")
