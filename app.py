@@ -7,13 +7,13 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 
-st.set_page_config(page_title="Item → ASIN Exporter (1 row per Item number)", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Item → ASIN Exporter (1 row per Item)", page_icon="📦", layout="wide")
 
 # =========================
 # Secrets
 # =========================
 CRAWLBASE_TOKEN = st.secrets.get("CRAWLBASE_TOKEN", "")
-APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+APP_PASSWORD    = st.secrets.get("APP_PASSWORD", "")
 
 if not CRAWLBASE_TOKEN:
     st.error("⚠️ Missing CRAWLBASE_TOKEN in Streamlit secrets.")
@@ -49,11 +49,13 @@ if not st.session_state.auth_ok:
 # =========================
 st.title("Item → ASIN Exporter (1 row per Item number)")
 st.caption(
-    "• Deduplicates on **Item number** (so each listing = 1 row)\n"
-    "• ASINs are derived from **Custom label (SKU)** if it starts with J17\n"
-    "• Only valid 10-character ASINs are queried\n"
-    "• Others remain in output with Amazon fields = **not found**"
+    "• Deduplicates on **Item number** (each listing = 1 row)\n"
+    "• ASINs derived from **Custom label (SKU)** only if it starts with J17 (case-insensitive)\n"
+    "• Queries **valid** 10-alphanumeric ASINs only\n"
+    "• Computes fee-adjusted eBay price and compares to Amazon price\n"
+    "• Orders key columns first"
 )
+
 st.button("Logout", on_click=do_logout)
 
 left, right = st.columns([3, 2])
@@ -65,7 +67,7 @@ with left:
         max_concurrency = st.slider("Max concurrent requests", 1, 20, 20)
 
     upl = st.file_uploader(
-        "Upload file (.csv or .xlsx) with **Item number** and **Custom label (SKU)**",
+        "Upload file (.csv or .xlsx) with **Item number**, **Title**, **Custom label (SKU)**, **Available quantity**, **Current price**",
         type=["csv", "xlsx"]
     )
 
@@ -78,17 +80,27 @@ with right:
 # =========================
 # Helpers
 # =========================
-SKU_COL = "Custom label (SKU)"
 ITEM_COL = "Item number"
-ASIN_RE = re.compile(r"^[A-Za-z0-9]{10}$")
+SKU_COL  = "Custom label (SKU)"
+TITLE_COL = "Title"
+QTY_COL   = "Available quantity"
+CURR_PRICE_COL = "Current price"
+
+ASIN_RE  = re.compile(r"^[A-Za-z0-9]{10}$")
 AMZ_COLS = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
 
 def sanitize_text(s: str) -> str:
+    # Replace the standalone word 'amazon' with 'ams'
     if not isinstance(s, str):
         return s
     return re.sub(r'\bamazon\b', 'ams', s, flags=re.IGNORECASE)
 
 def extract_asin_from_j17(sku: str) -> str | None:
+    """
+    From a SKU that starts with j17/J17, remove first 3 chars,
+    then extract the FIRST 10-char alphanumeric token (ASIN-like).
+    Return it only if it matches the ASIN pattern.
+    """
     if not isinstance(sku, str):
         return None
     s = sku.strip()
@@ -114,133 +126,39 @@ def add_log(line: str, holder, buf: list[str]):
     buf.append(line)
     holder.write("\n".join(buf[-200:]))
 
-def update_progress(done: int, total: int, bar, txt):
+def update_progress(done: int, total: int):
     pct = int((done / total) * 100) if total else 0
-    bar.progress(pct, text=f"Processing {done}/{total}…")
-    txt.write(f"Processed {done} of {total}")
+    progress_bar.progress(pct, text=f"Processing {done}/{total}…")
+    counter_txt.write(f"Processed {done} of {total}")
 
-# =========================
-# Crawlbase fetch
-# =========================
-async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, asin: str, sem: asyncio.Semaphore):
-    amazon_url = f"https://{domain}/dp/{asin}"
-    encoded_url = urllib.parse.quote(amazon_url, safe="")
-    api_url = f"https://api.crawlbase.com/?token={token}&url={encoded_url}&scraper=amazon-product-details"
-    async with sem:
-        try:
-            async with session.get(api_url, timeout=60) as resp:
-                data = await resp.json(content_type=None)
-                if isinstance(data, dict) and data.get("error"):
-                    return {"ASIN": asin, "_ok": False, "_msg": f"API error: {data.get('error')}"}
-                body = (data or {}).get("body", {}) if isinstance(data, dict) else {}
-                features = body.get("features", []) or []
-                description = body.get("description", "") or ""
-                images = body.get("highResolutionImages", []) or []
-                html_features = "<br>".join(features) if features else ""
-                html_combined = f"{html_features}<br><br>{description}" if html_features else description
-                images_cleaned = ", ".join(images) if isinstance(images, list) else ""
-                return {
-                    "ASIN": asin,
-                    "TITLE": sanitize_text(body.get("name")),
-                    "body_html": sanitize_text(html_combined),
-                    "price": body.get("rawPrice"),
-                    "highResolutionImages": images_cleaned,
-                    "Brand": sanitize_text(body.get("brand")),
-                    "isPrime": body.get("isPrime"),
-                    "inStock": body.get("inStock"),
-                    "stockDetail": body.get("stockDetail"),
-                    "_ok": True, "_msg": "OK"
-                }
-        except Exception as e:
-            return {"ASIN": asin, "_ok": False, "_msg": f"Exception: {e}"}
-
-async def fetch_all(asins, token, domain, max_conc, log_holder, log_buf, bar, txt):
-    sem = asyncio.Semaphore(max_conc)
-    out, total, done = [], len(asins), 0
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_asin(session, token, domain, a, sem) for a in asins]
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            out.append(res)
-            done += 1
-            status = res.get("_msg", "")
-            title  = res.get("TITLE") or ""
-            add_log(f"{'✅' if res.get('_ok') else '❌'} {res.get('ASIN')} • {title[:60]} • {status}",
-                    log_holder, log_buf)
-            update_progress(done, total, bar, txt)
-    return out
-
-# =========================
-# Main
-# =========================
-if upl is not None:
-    # Read CSV/XLSX
+def parse_money(val):
+    """
+    Robust price parser: strips symbols, handles commas and decimals.
+    Returns float or None.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    # Keep digits, dot, comma, minus; drop everything else
+    s = re.sub(r"[^0-9\.,-]", "", s)
+    if s == "":
+        return None
+    # If both comma and dot, treat comma as thousands sep
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s and "." not in s:
+        # Only comma -> decimal comma
+        s = s.replace(",", ".")
     try:
-        if upl.name.lower().endswith(".csv"):
-            df_raw = pd.read_csv(upl)
-        else:
-            df_raw = pd.read_excel(upl)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        st.stop()
+        return float(s)
+    except:
+        return None
 
-    if ITEM_COL not in df_raw.columns or SKU_COL not in df_raw.columns:
-        st.error("Input must contain both 'Item number' and 'Custom label (SKU)' columns.")
-        st.stop()
-
-    # Deduplicate by Item number
-    df = df_raw.drop_duplicates(subset=[ITEM_COL], keep="first").reset_index(drop=True)
-
-    # Extract ASINs from SKU
-    df["ASIN"] = df[SKU_COL].apply(extract_asin_from_j17)
-
-    valid_asins = [a for a in df["ASIN"].tolist() if isinstance(a, str) and ASIN_RE.fullmatch(a)]
-    valid_asins = unique_preserve_order(valid_asins)
-
-    skipped_count = int(df["ASIN"].isna().sum())
-    st.info(
-        f"Input rows: {len(df_raw)} | Unique Item numbers: {df[ITEM_COL].nunique()} | "
-        f"Valid ASINs to fetch: {len(valid_asins)} | Skipped (invalid/non-J17): {skipped_count}"
-    )
-
-    if st.button("Run"):
-        log_holder = log_box.empty()
-        log_buf = []
-
-        if skipped_count > 0:
-            add_log(f"Skipping {skipped_count} rows (invalid/non-J17 ASIN)", log_holder, log_buf)
-
-        if len(valid_asins) == 0:
-            df_out = df.copy()
-            for c in AMZ_COLS:
-                df_out[c] = "not found"
-        else:
-            with st.spinner("Fetching Amazon details…"):
-                results = asyncio.run(
-                    fetch_all(valid_asins, CRAWLBASE_TOKEN, domain, max_concurrency, log_holder, log_buf, progress_bar, counter_txt)
-                )
-
-            df_amz = pd.DataFrame(results) if results else pd.DataFrame(columns=["ASIN"] + AMZ_COLS + ["_ok","_msg"])
-            if not df_amz.empty:
-                df_amz = df_amz.sort_values(by=["_ok","price","TITLE"], ascending=[False, False, False])
-                df_amz = df_amz.drop_duplicates(subset="ASIN", keep="first")
-
-            df_out = df.merge(
-                df_amz[["ASIN"] + AMZ_COLS] if not df_amz.empty else pd.DataFrame(columns=["ASIN"]+AMZ_COLS),
-                how="left", on="ASIN"
-            )
-            for c in AMZ_COLS:
-                if c not in df_out.columns:
-                    df_out[c] = "not found"
-                else:
-                    df_out[c] = df_out[c].where(df_out[c].notna(), "not found")
-
-        st.success(f"Done! Output rows: {len(df_out)} (1 row per Item number)")
-        preview_cols = [ITEM_COL, SKU_COL, "ASIN"] + AMZ_COLS
-        have = [c for c in preview_cols if c in df_out.columns]
-        st.dataframe(df_out[have].head(20), use_container_width=True)
-
-        ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_name = f"{os.path.splitext(upl.name)[0]}_ENRICHED_{ts_now}.csv"
-        csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download enriched CSV", data=csv_bytes, file_name=out_name, mime="text/csv", use_container_width=True)
+# =========================
+# Crawlbase fetch (valid ASINs ONLY)
+# =========================
+async def fetch_asin(session: aiohtt_
