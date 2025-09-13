@@ -49,11 +49,11 @@ if not st.session_state.auth_ok:
 # =========================
 st.title("Item → ASIN Exporter (1 row per Item number)")
 st.caption(
-    "• Deduplicates on **Item number** (each listing = 1 row)\n"
+    "• 1 row per **Item number**\n"
     "• ASINs derived from **Custom label (SKU)** only if it starts with J17 (case-insensitive)\n"
-    "• Queries **valid** 10-alphanumeric ASINs only\n"
-    "• Computes fee-adjusted eBay price and compares to Amazon price\n"
-    "• Orders key columns first"
+    "• Queries valid 10-alphanumeric ASINs only (no API calls for invalid)\n"
+    "• Computes eBay fee-adjusted price and compares to Amazon price\n"
+    "• Includes `soldBy` (seller name) and `maximumQuantity` from Amazon"
 )
 
 st.button("Logout", on_click=do_logout)
@@ -87,7 +87,11 @@ QTY_COL   = "Available quantity"
 CURR_PRICE_COL = "Current price"
 
 ASIN_RE  = re.compile(r"^[A-Za-z0-9]{10}$")
-AMZ_COLS = ["TITLE","body_html","price","highResolutionImages","Brand","isPrime","inStock","stockDetail"]
+# Added soldBy and maximumQuantity here:
+AMZ_COLS = [
+    "TITLE","body_html","price","highResolutionImages","Brand",
+    "isPrime","inStock","stockDetail","soldBy","maximumQuantity"
+]
 
 def sanitize_text(s: str) -> str:
     # Replace the standalone word 'amazon' with 'ams'
@@ -172,12 +176,18 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
                 if isinstance(data, dict) and data.get("error"):
                     return {"ASIN": asin, "_ok": False, "_msg": f"API error: {data.get('error')}"}
                 body = (data or {}).get("body", {}) if isinstance(data, dict) else {}
+
                 features = body.get("features", []) or []
                 description = body.get("description", "") or ""
                 images = body.get("highResolutionImages", []) or []
                 html_features = "<br>".join(features) if features else ""
                 html_combined = f"{html_features}<br><br>{description}" if html_features else description
                 images_cleaned = ", ".join(images) if isinstance(images, list) else ""
+
+                # NEW: soldBy and maximumQuantity (sanitized)
+                sold_by = sanitize_text(body.get("soldBy"))
+                maximum_quantity = body.get("maximumQuantity")
+
                 return {
                     "ASIN": asin,
                     "TITLE": sanitize_text(body.get("name")),
@@ -188,6 +198,8 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
                     "isPrime": body.get("isPrime"),
                     "inStock": body.get("inStock"),
                     "stockDetail": body.get("stockDetail"),
+                    "soldBy": sold_by,
+                    "maximumQuantity": maximum_quantity,
                     "_ok": True, "_msg": "OK"
                 }
         except Exception as e:
@@ -310,10 +322,11 @@ if upl is not None:
             "isPrime",
             "inStock",
             "stockDetail",
+            "soldBy",            # NEW
+            "maximumQuantity",   # NEW
             "Ebay price after fee",
             "Amazon price higher then ebay",
         ]
-        # Make sure all preferred exist; if some don't, they just won't appear first
         have_pref = [c for c in preferred if c in df_out.columns]
         other_cols = [c for c in df_out.columns if c not in have_pref]
         df_out = df_out[have_pref + other_cols]
