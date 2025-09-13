@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import json
 import urllib.parse
 import asyncio
 import aiohttp
@@ -7,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 
-st.set_page_config(page_title="Item → ASIN Exporter (1 row per Item)", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Item → ASIN Exporter (1 row per Item, with History)", page_icon="📦", layout="wide")
 
 # =========================
 # Secrets
@@ -45,17 +47,60 @@ if not st.session_state.auth_ok:
     st.stop()
 
 # =========================
+# History (files + index)
+# =========================
+HISTORY_DIR = "history"
+INDEX_PATH  = os.path.join(HISTORY_DIR, "index.json")
+os.makedirs(HISTORY_DIR, exist_ok=True)
+if not os.path.exists(INDEX_PATH):
+    with open(INDEX_PATH, "w") as f:
+        json.dump([], f)
+
+def now_stamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def index_load():
+    try:
+        with open(INDEX_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def index_save_entry(entry: dict, keep_last: int = 50):
+    data = index_load()
+    data.insert(0, entry)
+    data = data[:keep_last]
+    with open(INDEX_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+def save_uploaded_copy(uploaded_file) -> str:
+    """Store a copy of the uploaded file under history/ and return path."""
+    stamp = now_stamp()
+    base  = os.path.splitext(uploaded_file.name)[0]
+    ext   = os.path.splitext(uploaded_file.name)[1]
+    path  = os.path.join(HISTORY_DIR, f"{base}_INPUT_{stamp}{ext}")
+    with open(path, "wb") as out:
+        out.write(uploaded_file.getvalue())
+    return path
+
+def save_output_csv(df: pd.DataFrame, uploaded_name: str) -> str:
+    stamp = now_stamp()
+    base  = os.path.splitext(uploaded_name)[0]
+    path  = os.path.join(HISTORY_DIR, f"{base}_ENRICHED_{stamp}.csv")
+    df.to_csv(path, index=False)
+    return path
+
+# =========================
 # UI
 # =========================
 st.title("Item → ASIN Exporter (1 row per Item number)")
 st.caption(
-    "• 1 row per **Item number**\n"
+    "• Deduplicates on **Item number** (each listing = 1 row)\n"
     "• ASINs derived from **Custom label (SKU)** only if it starts with J17 (case-insensitive)\n"
-    "• Queries valid 10-alphanumeric ASINs only (no API calls for invalid)\n"
+    "• Queries valid 10-alphanumeric ASINs only (no calls for invalid)\n"
     "• Computes eBay fee-adjusted price and compares to Amazon price\n"
-    "• Includes `soldBy` (seller name) and `maximumQuantity` from Amazon"
+    "• Keeps a local **History** of recent input/output files"
 )
-
 st.button("Logout", on_click=do_logout)
 
 left, right = st.columns([3, 2])
@@ -77,6 +122,27 @@ with right:
     progress_bar = st.progress(0, text="Idle")
     counter_txt = st.empty()
 
+# Sidebar: History
+with st.sidebar:
+    st.header("🗂️ History (recent)")
+    hist = index_load()
+    if not hist:
+        st.caption("No runs saved yet.")
+    else:
+        for i, item in enumerate(hist[:20]):  # show last 20
+            with st.expander(f"{item.get('timestamp','')} • {item.get('count',0)} items"):
+                st.caption(f"Domain: {item.get('domain','')}")
+                ipath = item.get("input_path")
+                opath = item.get("output_path")
+                if ipath and os.path.exists(ipath):
+                    with open(ipath, "rb") as f:
+                        st.download_button("⬇️ Download input", f.read(),
+                                           file_name=os.path.basename(ipath), key=f"hist_in_{i}")
+                if opath and os.path.exists(opath):
+                    with open(opath, "rb") as f:
+                        st.download_button("⬇️ Download output", f.read(),
+                                           file_name=os.path.basename(opath), key=f"hist_out_{i}")
+
 # =========================
 # Helpers
 # =========================
@@ -87,24 +153,18 @@ QTY_COL   = "Available quantity"
 CURR_PRICE_COL = "Current price"
 
 ASIN_RE  = re.compile(r"^[A-Za-z0-9]{10}$")
-# Added soldBy and maximumQuantity here:
+# Amazon fields (added soldBy, maximumQuantity)
 AMZ_COLS = [
     "TITLE","body_html","price","highResolutionImages","Brand",
     "isPrime","inStock","stockDetail","soldBy","maximumQuantity"
 ]
 
 def sanitize_text(s: str) -> str:
-    # Replace the standalone word 'amazon' with 'ams'
     if not isinstance(s, str):
         return s
     return re.sub(r'\bamazon\b', 'ams', s, flags=re.IGNORECASE)
 
 def extract_asin_from_j17(sku: str) -> str | None:
-    """
-    From a SKU that starts with j17/J17, remove first 3 chars,
-    then extract the FIRST 10-char alphanumeric token (ASIN-like).
-    Return it only if it matches the ASIN pattern.
-    """
     if not isinstance(sku, str):
         return None
     s = sku.strip()
@@ -136,10 +196,6 @@ def update_progress(done: int, total: int):
     counter_txt.write(f"Processed {done} of {total}")
 
 def parse_money(val):
-    """
-    Robust price parser: strips symbols, handles commas and decimals.
-    Returns float or None.
-    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -147,15 +203,12 @@ def parse_money(val):
     s = str(val).strip()
     if not s:
         return None
-    # Keep digits, dot, comma, minus; drop everything else
     s = re.sub(r"[^0-9\.,-]", "", s)
     if s == "":
         return None
-    # If both comma and dot, treat comma as thousands sep
     if "," in s and "." in s:
         s = s.replace(",", "")
     elif "," in s and "." not in s:
-        # Only comma -> decimal comma
         s = s.replace(",", ".")
     try:
         return float(s)
@@ -184,7 +237,6 @@ async def fetch_asin(session: aiohttp.ClientSession, token: str, domain: str, as
                 html_combined = f"{html_features}<br><br>{description}" if html_features else description
                 images_cleaned = ", ".join(images) if isinstance(images, list) else ""
 
-                # NEW: soldBy and maximumQuantity (sanitized)
                 sold_by = sanitize_text(body.get("soldBy"))
                 maximum_quantity = body.get("maximumQuantity")
 
@@ -224,7 +276,7 @@ async def fetch_all(asins, token, domain, max_conc, log_holder, log_buf):
 # Main
 # =========================
 if upl is not None:
-    # Read CSV/XLSX
+    # Read uploaded file + keep a copy in History
     try:
         if upl.name.lower().endswith(".csv"):
             df_raw = pd.read_csv(upl)
@@ -234,8 +286,10 @@ if upl is not None:
         st.error(f"Could not read file: {e}")
         st.stop()
 
+    input_copy_path = save_uploaded_copy(upl)
+
     # Validate required columns exist
-    required = [ITEM_COL, TITLE_COL, SKU_COL, QTY_COL, CURR_PRICE_COL]
+    required = ["Item number", "Title", "Custom label (SKU)", "Available quantity", "Current price"]
     missing = [c for c in required if c not in df_raw.columns]
     if missing:
         st.error("Missing required columns: " + ", ".join(missing))
@@ -274,7 +328,6 @@ if upl is not None:
                 )
             df_amz = pd.DataFrame(results) if results else pd.DataFrame(columns=["ASIN"] + AMZ_COLS + ["_ok","_msg"])
             if not df_amz.empty:
-                # Prefer successful rows with data; simple sort heuristic
                 df_amz = df_amz.sort_values(by=["_ok","price","TITLE"], ascending=[False, False, False])
                 df_amz = df_amz.drop_duplicates(subset="ASIN", keep="first")
 
@@ -315,15 +368,15 @@ if upl is not None:
             ITEM_COL,
             TITLE_COL,
             SKU_COL,
-            QTY_COL,
-            CURR_PRICE_COL,
+            "Available quantity",
+            "Current price",
             "ASIN",
             "price",
             "isPrime",
             "inStock",
             "stockDetail",
-            "soldBy",            # NEW
-            "maximumQuantity",   # NEW
+            "soldBy",
+            "maximumQuantity",
             "Ebay price after fee",
             "Amazon price higher then ebay",
         ]
@@ -334,14 +387,22 @@ if upl is not None:
         st.success(f"Done! Output rows: {len(df_out)} (1 per Item number). Preview:")
         st.dataframe(df_out.head(20), use_container_width=True)
 
-        # 9) Download CSV
-        ts_now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"{os.path.splitext(upl.name)[0]}_ENRICHED_{ts_now}"
-        csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name=f"{base_name}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        # 9) Save to History and offer downloads
+        output_csv_path = save_output_csv(df_out, upl.name)
+        index_save_entry({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "domain": domain,
+            "count": int(df_out[ITEM_COL].nunique()),
+            "input_path": input_copy_path,
+            "output_path": output_csv_path
+        })
+
+        # Download (this run)
+        with open(output_csv_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download results (.csv)",
+                data=f.read(),
+                file_name=os.path.basename(output_csv_path),
+                mime="text/csv",
+                use_container_width=True
+            )
